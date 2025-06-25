@@ -116,3 +116,188 @@
         victim_count: uint
     })
 
+
+
+(define-map sentinel_registry
+    {sentinel_id: principal}
+    {
+        reserved_amount: uint,
+        assessment_count: uint,
+        precision_metric: uint,
+        recent_activity_epoch: uint,
+        operational_mode: (string-ascii 20)
+    })
+
+
+(define-read-only (check_threat_status (web_identifier (string-ascii 255)))
+    (is-some (map-get? malicious_site_registry {web_identifier: web_identifier})))
+
+(define-read-only (fetch_sentinel_rating (sentinel_id principal))
+    (match (map-get? sentinel_performance_log {sentinel_id: sentinel_id, target_site: ""})
+        some_data (get credibility_score some_data)
+        u0))
+
+(define-read-only (fetch_site_status (web_identifier (string-ascii 255)))
+    (match (map-get? registered_sites {web_identifier: web_identifier})
+        some_entry (ok some_entry)
+        (err ENTRY_MISSING_ERROR)))
+
+
+;; Core operations
+(define-public (register_secure_site 
+    (web_identifier (string-ascii 255))
+    (security_endorsement (string-ascii 50)))
+    (let (
+        (current_epoch (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (collateral_requirement (* BASE_COLLATERAL_REQUIREMENT (var-get protection_intensity))))
+
+        ;; Input validation
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (is-ok (validate-security-endorsement security_endorsement)) INVALID_SECURITY_ENDORSEMENT)
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (>= (stx-get-balance tx-sender) collateral_requirement) COLLATERAL_MISSING_ERROR)
+
+        (match (map-get? registered_sites {web_identifier: web_identifier})
+            some_entry DUPLICATE_ENTRY_ERROR
+            (begin
+                (try! (stx-transfer? collateral_requirement tx-sender (as-contract tx-sender)))
+                (map-set registered_sites
+                    {web_identifier: web_identifier}
+                    {
+                        site_proprietor: tx-sender,
+                        authentication_level: "verified",
+                        registration_epoch: current_epoch,
+                        threat_metric: u0,
+                        incident_tally: u0,
+                        locked_assets: collateral_requirement,
+                        safety_check_epoch: current_epoch,
+                        security_endorsement: security_endorsement
+                    })
+                (ok true)))))
+
+(define-public (submit_threat_alert 
+    (web_identifier (string-ascii 255)) 
+    (proof_documentation (string-ascii 500))
+    (threat_magnitude uint))
+    (let (
+        (current_epoch (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (sentinel_data (default-to 
+            {submission_count: u0, last_action_epoch: u0, credibility_score: u0, reserved_funds: u0, verified_submissions: u0}
+            (map-get? sentinel_performance_log {sentinel_id: tx-sender, target_site: web_identifier}))))
+
+        ;; Input validation
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (is-ok (validate-proof-documentation proof_documentation)) INVALID_PROOF_DOCUMENTATION)
+        (asserts! (is-ok (validate-threat-magnitude threat_magnitude)) INVALID_THREAT_MAGNITUDE)
+        (asserts! (not (var-get system_pause_state)) OPERATION_BLOCKED_ERROR)
+        (asserts! (>= (get credibility_score sentinel_data) TRUSTWORTHINESS_BASELINE) COLLATERAL_MISSING_ERROR)
+        (asserts! (> (- current_epoch (get last_action_epoch sentinel_data)) INACTIVITY_WINDOW) TIME_RESTRICTION_ERROR)
+
+        (map-set malicious_site_registry
+            {web_identifier: web_identifier}
+            {
+                alerting_entity: tx-sender,
+                detection_epoch: current_epoch,
+                proof_documentation: proof_documentation,
+                confirmation_state: "pending",
+                threat_magnitude: threat_magnitude,
+                victim_count: u1
+            })
+
+        (map-set sentinel_performance_log
+            {sentinel_id: tx-sender, target_site: web_identifier}
+            {
+                submission_count: (+ (get submission_count sentinel_data) u1),
+                last_action_epoch: current_epoch,
+                credibility_score: (+ (get credibility_score sentinel_data) u5),
+                reserved_funds: (get reserved_funds sentinel_data),
+                verified_submissions: (get verified_submissions sentinel_data)
+            })
+        (ok true)))
+
+(define-private (modify_site_risk (web_identifier (string-ascii 255)) (adjustment_value int))
+    (begin 
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (match (map-get? registered_sites {web_identifier: web_identifier})
+            some_entry 
+                (begin
+                    (map-set registered_sites
+                        {web_identifier: web_identifier}
+                        (merge some_entry {
+                            threat_metric: (+ (get threat_metric some_entry) 
+                                (if (> adjustment_value 0) 
+                                    (to-uint adjustment_value)
+                                    u0))
+                        }))
+                    (ok true))
+            ENTRY_MISSING_ERROR)))
+
+(define-public (validate_threat_report 
+    (web_identifier (string-ascii 255))
+    (is_valid bool))
+    (let (
+        (current_epoch (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (sentinel_status (unwrap! (map-get? sentinel_registry {sentinel_id: tx-sender}) ACCESS_FORBIDDEN)))
+
+        (asserts! (is-ok (validate-web-identifier web_identifier)) INVALID_WEB_IDENTIFIER)
+        (asserts! (>= (get reserved_amount sentinel_status) BASE_COLLATERAL_REQUIREMENT) COLLATERAL_MISSING_ERROR)
+
+        (map-set sentinel_registry
+            {sentinel_id: tx-sender}
+            (merge sentinel_status {
+                assessment_count: (+ (get assessment_count sentinel_status) u1),
+                recent_activity_epoch: current_epoch
+            }))
+        (if is_valid
+            (modify_site_risk web_identifier 10)
+            (modify_site_risk web_identifier -5))))
+
+
+(define-public (modify_protection_level (new_level uint))
+    (begin
+        (asserts! (is-ok (validate-protection-level new_level)) INVALID_PROTECTION_LEVEL)
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (var-set protection_intensity new_level)
+        (ok true)))
+
+(define-public (toggle_system_state (pause_state bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (var-set system_pause_state pause_state)
+        (ok true)))
+
+(define-public (reassign_system_control (new_controller principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (not (is-eq new_controller 'SP000000000000000000002Q6VF78)) INVALID_CONTROLLER_ADDRESS)
+        (var-set system_controller new_controller)
+        (ok true)))
+
+;; System initialization
+(define-public (initialize_system (admin principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get system_controller)) ACCESS_FORBIDDEN)
+        (asserts! (not (is-eq admin 'SP000000000000000000002Q6VF78)) INVALID_CONTROLLER_ADDRESS)
+        (var-set system_controller admin)
+        (var-set protection_intensity u1)
+        (var-set system_pause_state false)
+        (ok true)))
+
+(define-public (enlist_sentinel (collateral_amount uint))
+    (let (
+        (current_epoch (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+        (asserts! (>= collateral_amount BASE_COLLATERAL_REQUIREMENT) COLLATERAL_MISSING_ERROR)
+        (asserts! (>= (stx-get-balance tx-sender) collateral_amount) COLLATERAL_MISSING_ERROR)
+
+        (map-set sentinel_registry
+            {sentinel_id: tx-sender}
+            {
+                reserved_amount: collateral_amount,
+                assessment_count: u0,
+                precision_metric: u100,
+                recent_activity_epoch: current_epoch,
+                operational_mode: "active"
+            })
+        (unwrap! (stx-transfer? collateral_amount tx-sender (as-contract tx-sender))
+                 COLLATERAL_MISSING_ERROR)
+        (ok true)))
